@@ -7,8 +7,9 @@ import os
 import subprocess
 import sys
 
-from InquirerPy import inquirer
+from InquirerPy import get_style, inquirer
 from InquirerPy.base.control import Choice
+from InquirerPy.prompts.checkbox import CheckboxPrompt, InquirerPyCheckboxControl
 from rich.console import Console
 from rich.table import Table
 
@@ -19,6 +20,54 @@ from mcpm.profile.profile_config import ProfileConfigManager
 from mcpm.utils.display import print_error
 from mcpm.utils.non_interactive import is_non_interactive, parse_server_list, should_force_operation
 from mcpm.utils.rich_click_config import click
+
+
+class _StartupAwareCheckbox(CheckboxPrompt):
+    def __init__(self, startup_disabled: set, *args, **kwargs):
+        self._startup_disabled = startup_disabled
+
+        original_control_cls = InquirerPyCheckboxControl
+        outer = self
+
+        class _PatchedControl(original_control_cls):
+            def _dot_class(self, choice) -> str:
+                val = choice.get("value", "")
+                if isinstance(val, str) and val.startswith("server:") and val[7:] in outer._startup_disabled:
+                    return "class:checkbox-off"
+                return "class:checkbox"
+
+            def _get_hover_text(self, choice):
+                return [
+                    (self._dot_class(choice) if cls == "class:checkbox" else cls, txt)
+                    for cls, txt in super()._get_hover_text(choice)
+                ]
+
+            def _get_normal_text(self, choice):
+                return [
+                    (self._dot_class(choice) if cls == "class:checkbox" else cls, txt)
+                    for cls, txt in super()._get_normal_text(choice)
+                ]
+
+        import InquirerPy.prompts.checkbox as _cb_mod
+
+        _orig = _cb_mod.InquirerPyCheckboxControl
+        _cb_mod.InquirerPyCheckboxControl = _PatchedControl
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            _cb_mod.InquirerPyCheckboxControl = _orig
+
+        @self.register_kb("e")
+        def _toggle_startup(event):
+            choice = self.content_control.selection
+            val = choice.get("value", "")
+            if isinstance(val, str) and val.startswith("server:"):
+                name = val[7:]
+                if name in self._startup_disabled:
+                    self._startup_disabled.discard(name)
+                else:
+                    self._startup_disabled.add(name)
+
 
 console = Console()
 client_config_manager = ClientConfigManager()
@@ -338,6 +387,15 @@ def edit_client(
         client_manager, global_server_names=set(global_servers.keys())
     )
 
+    supports_enabled = getattr(client_manager, "client_key", None) in ("opencode", "goose-cli")
+    current_server_enabled_states = {}
+    if supports_enabled:
+        for server_name in current_individual_servers:
+            prefixed = f"mcpm_{server_name}"
+            srv = client_manager.get_server(prefixed)
+            if srv is not None:
+                current_server_enabled_states[server_name] = getattr(srv, "enabled", None)
+
     # Display current status
     console.print("[bold]Current MCPM Configuration:[/]")
     table = Table(show_header=True, header_style="bold magenta")
@@ -364,7 +422,13 @@ def edit_client(
 
     # Show individual servers
     for server_name, server_config in global_servers.items():
-        status = "[green]Enabled[/]" if server_name in current_individual_servers else "[red]Disabled[/]"
+        in_client = server_name in current_individual_servers
+        if in_client and supports_enabled and current_server_enabled_states.get(server_name) is False:
+            status = "[yellow]In client (startup: off)[/]"
+        elif in_client:
+            status = "[green]In client[/]"
+        else:
+            status = "[red]Not in client[/]"
         description = getattr(server_config, "description", "") or ""
         table.add_row(server_name, "Server", status, description[:40] + "..." if len(description) > 40 else description)
 
@@ -381,6 +445,7 @@ def edit_client(
         available_profiles,
         global_servers,
         display_name,
+        current_server_enabled_states=current_server_enabled_states,
     )
 
 
@@ -436,6 +501,7 @@ def _interactive_profile_server_selection(
     available_profiles,
     global_servers,
     client_name,
+    current_server_enabled_states=None,
 ):
     """Interactive profile and server selection using InquirerPy with checkboxes."""
     try:
@@ -453,48 +519,61 @@ def _interactive_profile_server_selection(
             is_currently_enabled = profile_name in current_profiles
             choices.append(Choice(value=f"profile:{profile_name}", name=choice_name, enabled=is_currently_enabled))
 
-        # Add individual servers with server emoji
         for server_name in sorted(global_servers.keys()):
             server_config = global_servers[server_name]
             description = getattr(server_config, "description", "") or ""
+            in_client = server_name in current_individual_servers
             choice_name = f"🔧 {server_name} - {description[:40]}" + ("..." if len(description) > 40 else "")
-            is_currently_enabled = server_name in current_individual_servers
-            choices.append(Choice(value=f"server:{server_name}", name=choice_name, enabled=is_currently_enabled))
+            choices.append(Choice(value=f"server:{server_name}", name=choice_name, enabled=in_client))
 
         if not choices:
             console.print("[yellow]No MCPM profiles or servers available to configure.[/]")
             return
 
-        # Use InquirerPy checkbox for selection with retry loop for conflicts
-        console.print(f"\n[bold]Select profiles/servers to enable in {client_name}:[/]")
-        console.print(
-            "[dim]📦 = Profiles, 🔧 = Individual servers. Use space to toggle, enter to confirm, ESC to cancel[/]"
+        startup_disabled: set = set()
+        if current_server_enabled_states:
+            for sname, enabled_val in current_server_enabled_states.items():
+                if enabled_val is False:
+                    startup_disabled.add(sname)
+
+        supports_enabled = current_server_enabled_states is not None
+        e_hint = "  e=toggle startup on/off (🔴off 🟢on)" if supports_enabled else ""
+        prompt_msg = (
+            f"Select servers/profiles for {client_name}  [space=add/remove{e_hint}  enter=confirm  esc=cancel]:"
         )
 
-        while True:  # Retry loop for conflict resolution
-            selected_items = inquirer.checkbox(
-                message="Select profiles/servers to enable:",
-                choices=choices,
-                keybindings={"interrupt": [{"key": "escape"}]},
-            ).execute()
+        style = get_style({"checkbox": "#00ff00", "checkbox-off": "#ff0000"}, style_override=False)
+
+        while True:
+            if supports_enabled:
+                prompt = _StartupAwareCheckbox(
+                    startup_disabled=startup_disabled,
+                    message=prompt_msg,
+                    choices=choices,
+                    style=style,
+                    keybindings={"interrupt": [{"key": "escape"}]},
+                )
+                selected_items = prompt.execute()
+                startup_disabled = prompt._startup_disabled
+            else:
+                selected_items = inquirer.checkbox(
+                    message=prompt_msg,
+                    choices=choices,
+                    keybindings={"interrupt": [{"key": "escape"}]},
+                ).execute()
 
             if selected_items is None:
                 console.print("[yellow]Operation cancelled.[/]")
                 return
 
-            # Separate profiles and servers from selection
             selected_profiles = []
             selected_servers = []
-
             for item in selected_items:
                 if item.startswith("profile:"):
-                    profile_name = item[8:]  # Remove "profile:" prefix
-                    selected_profiles.append(profile_name)
+                    selected_profiles.append(item[8:])
                 elif item.startswith("server:"):
-                    server_name = item[7:]  # Remove "server:" prefix
-                    selected_servers.append(server_name)
+                    selected_servers.append(item[7:])
 
-            # Check for conflicts
             conflicts = _check_profile_server_conflicts(selected_profiles, selected_servers, available_profiles)
             if conflicts:
                 console.print("\n[red]⚠️  Configuration conflicts detected:[/]")
@@ -502,45 +581,37 @@ def _interactive_profile_server_selection(
                     console.print(f"  [yellow]•[/] {conflict}")
                 console.print("\n[dim]Profiles and individual servers cannot both contain the same server.[/]")
                 console.print("[dim]Please adjust your selection below:[/]\n")
-
-                # Update the choices to reflect current selection for retry
                 for choice in choices:
-                    if choice.value in selected_items:
-                        choice.enabled = True
-                    else:
-                        choice.enabled = False
-                continue  # Go back to selection
+                    choice.enabled = choice.value in selected_items
+                continue
             else:
-                break  # No conflicts, proceed
+                break
 
-        # Check if changes were made
         current_profiles_set = set(current_profiles)
         current_servers_set = set(current_individual_servers)
         new_profiles_set = set(selected_profiles)
         new_servers_set = set(selected_servers)
 
-        if new_profiles_set == current_profiles_set and new_servers_set == current_servers_set:
+        disabled_servers = startup_disabled & new_servers_set
+        startup_changed = disabled_servers != (
+            {s for s, v in (current_server_enabled_states or {}).items() if v is False} & new_servers_set
+        )
+
+        if new_profiles_set == current_profiles_set and new_servers_set == current_servers_set and not startup_changed:
             console.print("[yellow]No changes made.[/]")
             return
 
         added_servers = new_servers_set - current_servers_set
-        disabled_servers = set()
-        if added_servers:
-            console.print("\n[bold]Set server startup state:[/]")
-            for server_name in sorted(added_servers):
-                try:
-                    should_disable = inquirer.confirm(
-                        message=f"Add '{server_name}' as disabled by default?",
-                        default=False,
-                    ).execute()
-                    if should_disable:
-                        disabled_servers.add(server_name)
-                except Exception:
-                    pass
 
         # Save the updated configuration
         _save_config_with_profiles_and_servers(
-            client_manager, config_path, current_config, selected_profiles, selected_servers, client_name, disabled_servers
+            client_manager,
+            config_path,
+            current_config,
+            selected_profiles,
+            selected_servers,
+            client_name,
+            disabled_servers,
         )
 
         # Show what changed
@@ -633,7 +704,9 @@ def _save_config_with_profiles_and_servers(
         for server_name in selected_servers:
             prefixed_name = f"mcpm_{server_name}"
             enabled_value = False if (disabled_servers and server_name in disabled_servers) else None
-            server_config = STDIOServerConfig(name=prefixed_name, command="mcpm", args=["run", server_name], enabled=enabled_value)
+            server_config = STDIOServerConfig(
+                name=prefixed_name, command="mcpm", args=["run", server_name], enabled=enabled_value
+            )
             client_manager.add_server(server_config)
 
         console.print(f"[green]Successfully updated {client_name} configuration![/]")
